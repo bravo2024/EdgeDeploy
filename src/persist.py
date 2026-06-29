@@ -1,14 +1,12 @@
 from __future__ import annotations
-import pickle
+import torch
 from pathlib import Path
 
-
-def save_model(model, path="models/model.pkl"):
+def save_model(model, path="models/model.pth"):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump(model, f)
+    torch.save(model.state_dict(), path)
 
-
-def load_model(path="models/model.pkl"):
-    with open(path, "rb") as f:
-        return pickle.load(f)
+def load_model(model_class, path="models/model.pth", num_classes=1000):
+    model = model_class(num_classes=num_classes)
+    model.load_state_dict(torch.load(path, map_location="cpu"))
+    return model

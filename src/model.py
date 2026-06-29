@@ -1,129 +1,76 @@
 from __future__ import annotations
+import torch
+import torch.nn as nn
+import onnx
+import onnxruntime as ort
 import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import StratifiedKFold
-from src.core import build_models, compute_metrics, ks_statistic
+from pathlib import Path
+import time
 
+def build_mobilenet(num_classes=1000):
+    import torchvision
+    model = torchvision.models.mobilenet_v2(weights=torchvision.models.MobileNet_V2_Weights.DEFAULT)
+    return model
 
-def train_all_models(data, seed=42, test_size=0.25):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    from sklearn.model_selection import train_test_split as _tts
-    X_train, X_test, y_train, y_test = _tts(
-        X, y, test_size=test_size, stratify=y, random_state=seed
-    )
-    scaler = StandardScaler()
-    num_cols_actual = [c for c in num_cols if c in X_train.columns]
-    X_train_scaled = X_train.copy()
-    X_test_scaled = X_test.copy()
-    if num_cols_actual:
-        X_train_scaled[num_cols_actual] = scaler.fit_transform(X_train[num_cols_actual])
-        X_test_scaled[num_cols_actual] = scaler.transform(X_test[num_cols_actual])
-    models = build_models(X_train_scaled, y_train, seed=seed)
-    results = {}
-    for name, model in models.items():
-        y_proba = model.predict_proba(X_test_scaled)[:, 1]
-        y_pred = (y_proba >= 0.5).astype(int)
-        metrics = compute_metrics(y_test, y_pred, y_proba)
-        metrics["ks"] = ks_statistic(y_test, y_proba)
-        results[name] = {"metrics": metrics, "y_proba": y_proba, "y_pred": y_pred}
+@torch.no_grad()
+def evaluate_model(model, loader, device="cpu"):
+    model.eval()
+    model.to(device)
+    correct, total = 0, 0
+    latencies = []
+    for images, labels in loader:
+        images, labels = images.to(device), labels.to(device)
+        start = time.perf_counter()
+        outputs = model(images)
+        latencies.append((time.perf_counter() - start) * 1000)
+        preds = outputs.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
     return {
-        "models": models,
-        "results": results,
-        "scaler": scaler,
-        "X_train": X_train_scaled,
-        "X_test": X_test_scaled,
-        "y_train": y_train,
-        "y_test": y_test,
-        "features": list(X.columns),
-        "n_train": len(y_train),
-        "n_test": len(y_test),
+        "accuracy": correct / total,
+        "avg_latency_ms": float(np.mean(latencies)),
+        "p50_latency_ms": float(np.median(latencies)),
+        "p95_latency_ms": float(np.percentile(latencies, 95)),
+        "throughput_fps": float(1000 / np.mean(latencies) * loader.batch_size),
     }
 
+def export_to_onnx(model, path="models/model.onnx", opset_version=18):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    model.eval()
+    x = torch.randn(1, 3, 224, 224)
+    torch.onnx.export(model, x, path,
+                      input_names=["input"], output_names=["output"],
+                      opset_version=opset_version, dynamo=False)
+    onnx_model = onnx.load(path)
+    onnx.checker.check_model(onnx_model)
+    return path
 
-def cross_validate(data, seed=42, n_folds=5):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    num_cols_actual = [c for c in num_cols if c in X.columns]
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    cv_results = {name: {"roc_auc": [], "gini": [], "ks": [], "f1": []}
-                  for name in ["Logistic Regression", "Random Forest", "Gradient Boosting", "XGBoost"]}
-    for train_idx, test_idx in skf.split(X, y):
-        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-        y_tr, y_te = y[train_idx], y[test_idx]
-        scaler = StandardScaler()
-        if num_cols_actual:
-            X_tr_scaled = X_tr.copy()
-            X_te_scaled = X_te.copy()
-            X_tr_scaled[num_cols_actual] = scaler.fit_transform(X_tr[num_cols_actual])
-            X_te_scaled[num_cols_actual] = scaler.transform(X_te[num_cols_actual])
-        else:
-            X_tr_scaled, X_te_scaled = X_tr, X_te
-        models = build_models(X_tr_scaled, y_tr, seed=seed)
-        for name, model in models.items():
-            y_proba = model.predict_proba(X_te_scaled)[:, 1]
-            y_pred = (y_proba >= 0.5).astype(int)
-            met = compute_metrics(y_te, y_pred, y_proba)
-            cv_results[name]["roc_auc"].append(met.get("roc_auc", 0))
-            cv_results[name]["gini"].append(met.get("gini", 0))
-            cv_results[name]["ks"].append(ks_statistic(y_te, y_proba))
-            cv_results[name]["f1"].append(met.get("f1", 0))
-    summary = {}
-    for name, scores in cv_results.items():
-        summary[name] = {}
-        for metric, vals in scores.items():
-            summary[name][metric] = {
-                "mean": float(np.mean(vals)),
-                "std": float(np.std(vals)),
-                "values": [float(v) for v in vals],
-            }
-    return summary
+def benchmark_onnx(path, loader, num_threads=1):
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = num_threads
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess = ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+    input_name = sess.get_inputs()[0].name
+    latencies = []
+    for images, _ in loader:
+        batch = images.numpy()
+        start = time.perf_counter()
+        sess.run(None, {input_name: batch})
+        latencies.append((time.perf_counter() - start) * 1000)
+    bs = loader.batch_size
+    return {
+        "avg_latency_ms": float(np.mean(latencies)),
+        "p50_latency_ms": float(np.median(latencies)),
+        "p95_latency_ms": float(np.percentile(latencies, 95)),
+        "throughput_fps": float(1000 / np.mean(latencies) * bs),
+        "num_threads": num_threads,
+    }
 
+def quantize_onnx(onnx_path, output_path="models/model_quantized.onnx"):
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    import onnxruntime.quantization as quant
+    quant.quantize_dynamic(onnx_path, output_path, weight_type=quant.QuantType.QInt8)
+    return output_path
 
-def permutation_importance(model, X_val, y_val, metric_fn, n_repeats=10, seed=42):
-    rng = np.random.default_rng(seed)
-    baseline = metric_fn(y_val, model.predict_proba(X_val)[:, 1])
-    importances = []
-    for col_idx in range(X_val.shape[1]):
-        scores = []
-        for _ in range(n_repeats):
-            X_perm = X_val.copy()
-            X_perm[:, col_idx] = rng.permutation(X_perm[:, col_idx])
-            score = metric_fn(y_val, model.predict_proba(X_perm)[:, 1])
-            scores.append(baseline - score)
-        importances.append({
-            "mean": float(np.mean(scores)),
-            "std": float(np.std(scores)),
-        })
-    return importances
-
-
-def threshold_sweep(y_true, y_proba):
-    thresholds = np.linspace(0.05, 0.95, 91)
-    rows = []
-    for tau in thresholds:
-        y_pred = (y_proba >= tau).astype(int)
-        met = compute_metrics(y_true, y_pred, y_proba)
-        met["threshold"] = float(tau)
-        met["accept_rate"] = float((y_pred == 0).mean())
-        rows.append(met)
-    return pd.DataFrame(rows)
+def get_model_size(path):
+    return Path(path).stat().st_size / (1024 * 1024)

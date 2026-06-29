@@ -1,8 +1,41 @@
 from __future__ import annotations
 import sys; from pathlib import Path; sys.path.insert(0, str(Path(__file__).parent.parent))
-import numpy as np; from src.data import make_synthetic; from src.model import train_all_models, cross_validate
-def test_data(): d=make_synthetic(500); assert d["X"].shape[0]==500 and 0.1<d["positive_rate"]<0.5
-def test_train(): d=make_synthetic(300); b=train_all_models(d); assert len(b["models"])==4
-def test_xgb(): d=make_synthetic(300); assert train_all_models(d)["results"]["XGBoost"]["metrics"].get("roc_auc",0)>0.5
-def test_cv(): d=make_synthetic(300); cv=cross_validate(d,seed=42,n_folds=3); assert all(s["roc_auc"]["mean"]>0.5 for s in cv.values())
-def test_metrics(): d=make_synthetic(200); b=train_all_models(d); m=b["results"]["XGBoost"]["metrics"]; assert all(0<=m[k]<=1 for k in ["accuracy","precision","recall","f1"])
+import torch
+from src.data import make_synthetic, create_dataloaders
+from src.model import build_mobilenet, evaluate_model
+
+def test_data():
+    data = make_synthetic(n=10, seed=42)
+    assert data["images"].shape == (10, 3, 224, 224)
+    assert data["n_samples"] == 10
+
+def test_dataloader():
+    data = make_synthetic(n=10, seed=42)
+    tl, vl = create_dataloaders(data, batch_size=4)
+    batch = next(iter(tl))
+    assert batch[0].shape == (4, 3, 224, 224)
+
+def test_model():
+    model = build_mobilenet(num_classes=1000)
+    x = torch.randn(2, 3, 224, 224)
+    out = model(x)
+    assert out.shape == (2, 1000)
+
+def test_evaluate():
+    data = make_synthetic(n=20, seed=42)
+    _, vl = create_dataloaders(data, batch_size=10)
+    model = build_mobilenet(num_classes=1000)
+    m = evaluate_model(model, vl, device="cpu")
+    assert "accuracy" in m
+    assert "avg_latency_ms" in m
+    assert "throughput_fps" in m
+
+def test_export_onnx():
+    from src.model import export_to_onnx, get_model_size
+    import os
+    model = build_mobilenet(num_classes=1000)
+    path = "models/test_model.onnx"
+    export_to_onnx(model, path, opset_version=18)
+    assert get_model_size(path) > 0
+    if os.path.exists(path):
+        os.remove(path)

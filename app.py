@@ -1,84 +1,78 @@
 from __future__ import annotations
 import sys; from pathlib import Path; sys.path.insert(0, str(Path(__file__).parent))
-import numpy as np, pandas as pd, streamlit as st, matplotlib.pyplot as plt
-from src.data import make_synthetic, TARGET_NAME
-from src.model import train_all_models, cross_validate
-from src.visualizations import *
-st.set_page_config(page_title="EdgeDeploy | OctoML Edge AI", layout="wide", page_icon="\U0001f310")
+import streamlit as st
+import pandas as pd
+from src.model import build_mobilenet, evaluate_model, export_to_onnx, benchmark_onnx, quantize_onnx, get_model_size
+from src.data import make_synthetic, create_dataloaders
+from src.visualizations import plot_latency_comparison, plot_size_comparison, plot_throughput_comparison
+
+st.set_page_config(page_title="EdgeDeploy | ONNX Edge Benchmark", layout="wide", page_icon="\U0001f4e1")
+
 with st.sidebar:
-    st.header("\u2699 Config"); n=st.slider("Samples",2000,20000,10000,1000); tau=st.slider("Threshold",0.05,0.95,0.50,0.05)
-    st.caption("OctoML | Apache TVM Auto-Tuning & Edge Deployment")
-data=make_synthetic(n=n); b=train_all_models(data)
-y_test=b["y_test"]; y_probas={n:b["results"][n]["y_proba"] for n in b["results"]}
-best=max(b["results"],key=lambda n: b["results"][n]["metrics"].get("roc_auc",0))
-c1,c2,c3,c4=st.columns(4)
-c1.metric("Samples",f"{n:,}"); c2.metric("Deployment Success",f"{data['positive_rate']:.1%}")
-c3.metric("Best AUC",f"{b['results'][best]['metrics']['roc_auc']:.4f}"); c4.metric("Best",best)
-t1,t2,t3,t4=st.tabs(["\U0001f4ca Explorer","\U0001f52c Model Lab","\U0001f4a1 Performance","\U0001f527 Deployment"])
-with t1:
-    st.dataframe(data["df"].head(50),use_container_width=True,height=200)
-    fig,ax=plt.subplots(figsize=(5,3)); _style()
-    ax.bar(["Failed","Success"],[1-data["positive_rate"],data["positive_rate"]],color=["#f43f5e","#22c55e"])
-    for i,v in enumerate([1-data["positive_rate"],data["positive_rate"]]): ax.text(i,v+.01,f"{v:.1%}",ha="center",color="white")
-    ax.set_title("Deployment Outcome Distribution",color="white"); ax.grid(True,alpha=.2)
-    st.pyplot(fig)
-with t2:
-    rows=[{**{"Model":n},**{k:f"{v:.4f}" for k,v in r["metrics"].items() if k!="confusion_matrix"}} for n,r in b["results"].items()]
-    st.dataframe(pd.DataFrame(rows).set_index("Model"),use_container_width=True)
-    col_a,col_b=st.columns(2)
-    with col_a: st.pyplot(plot_roc_curve(y_test,y_probas))
-    with col_b: st.pyplot(plot_calibration_curve(y_test,y_probas))
-    st.pyplot(plot_confusion_matrix(y_test,b["results"]["XGBoost"]["y_pred"],"XGBoost"))
-    cv=cross_validate(data); cvr=[{"Model":n,"AUC":f"{s['roc_auc']['mean']:.4f}","\u00b1":f"\u00b1{s['roc_auc']['std']:.4f}"} for n,s in cv.items()]
-    st.dataframe(pd.DataFrame(cvr).set_index("Model"),use_container_width=True)
-with t3:
-    st.subheader("Performance Benchmarking")
-    col_a,col_b=st.columns(2)
-    with col_a:
-        fig,ax=plt.subplots(figsize=(5,4)); _style()
-        success=data["df"][data["df"]["deployment_success"]==1]["latency_ms"]
-        failed=data["df"][data["df"]["deployment_success"]==0]["latency_ms"]
-        ax.hist(success,bins=30,alpha=0.5,color="#22c55e",label="Success",density=True)
-        ax.hist(failed,bins=30,alpha=0.5,color="#f43f5e",label="Failed",density=True)
-        ax.set_title("Latency (ms)",color="white"); ax.legend(fontsize=8); ax.grid(True,alpha=.2)
-        st.pyplot(fig)
-    with col_b:
-        fig,ax=plt.subplots(figsize=(5,4)); _style()
-        success=data["df"][data["df"]["deployment_success"]==1]["memory_usage_mb"]
-        failed=data["df"][data["df"]["deployment_success"]==0]["memory_usage_mb"]
-        ax.hist(success,bins=30,alpha=0.5,color="#22c55e",label="Success",density=True)
-        ax.hist(failed,bins=30,alpha=0.5,color="#f43f5e",label="Failed",density=True)
-        ax.set_title("Memory Usage (MB)",color="white"); ax.legend(fontsize=8); ax.grid(True,alpha=.2)
-        st.pyplot(fig)
-    st.subheader("Throughput vs. Model Size")
-    fig,ax=plt.subplots(figsize=(8,4)); _style()
-    scatter=ax.scatter(data["df"]["model_size_mb"],data["df"]["throughput_qps"],c=data["df"]["deployment_success"],cmap="RdYlGn_r",alpha=0.4,s=5)
-    ax.set_xlabel("Model Size (MB)"); ax.set_ylabel("Throughput (QPS)"); ax.set_title("Throughput vs Model Size by Deployment Status",color="white")
-    plt.colorbar(scatter,ax=ax,label="Success")
-    st.pyplot(fig)
-with t4:
-    st.subheader("Deployment Optimization")
-    st.latex(r"\text{OptimalBatch} = \underset{b}{\arg\min} \; \alpha \cdot \text{Latency}(b) + \beta \cdot \text{Memory}(b)")
-    st.latex(r"S = \frac{1}{(1 - p) + p/N} \quad (\text{Amdahl's Law})")
-    st.caption("Amdahl's Law: speedup limited by serial fraction p. Even with infinite cores, max speedup = 1/(1-p). Critical for edge pipeline parallelization decisions.")
-    st.latex(r"\Delta = \frac{\max - \min}{2^b - 1} \quad (\text{quantization step size, } b = \text{bits})")
-    st.caption("Quantization error bound: reducing precision from FP32 to INT8 gives ~4× throughput but introduces a noise floor of Δ/2 per activation.")
-    st.latex(r"\text{TOPS} = \frac{\text{Operations}}{\text{Time}} \times 10^{-12}")
-    st.caption("TOPS: Trillions of Operations Per Second: standard edge-AI compute metric. Modern NPUs (e.g., Jetson Orin 275 TOPS, Raspberry Pi AI 13 TOPS) span 4-275 TOPS. OctoML's compiler targets heterogeneous hardware: GPU (CUDA), NPU (DLA), CPU (ARM/x86) from a single model artifact.")
-    st.subheader("TVM Auto-Tuning & Compilation")
-    st.latex(r"\text{Optimal Schedule} = \underset{s \in \mathcal{S}}{\arg\min} \; \text{Runtime}(s) \quad \text{s.t.} \quad \text{Memory}(s) \le M_{\text{target}}")
-    st.caption("OctoML's core technology (based on Apache TVM) uses ML-based auto-tuning to search the space of operator schedules S on target hardware. The cost model predicts runtime from schedule features (tiling, vectorization, thread binding).")
-    st.latex(r"\text{Compilation Time} = \sum_{\text{ops}} \text{TrialTime}(op) \times \text{Iterations}, \quad \text{Speedup} = \frac{\text{Baseline}}{\text{Tuned}}")
-    st.caption("Auto-tuning iteration: each operator is benchmarked with candidate schedules on the target (Jetson Orin, Raspberry Pi 5, x86). OctoML's cloud platform reduces compilation time via learned cost models that prune the search space by 10-100×.")
-    st.markdown("**Quantization Impact:**")
-    quant_success=data["df"].groupby("quantization_type")[TARGET_NAME].mean()
-    fig,ax=plt.subplots(figsize=(5,3)); _style()
-    colors={"none":"#f43f5e","fp32":"#f97316","fp16":"#fbbf24","int8":"#22c55e"}
-    ax.bar(quant_success.index,quant_success.values,color=[colors.get(q,"#22d3ee") for q in quant_success.index])
-    ax.set_title("Deployment Success by Quantization",color="white"); ax.grid(True,alpha=.2)
-    st.pyplot(fig)
-    c1,c2,c3=st.columns(3)
-    c1.metric("Avg Latency",f"{data['df']['latency_ms'].mean():.1f}ms")
-    c2.metric("Avg Throughput",f"{data['df']['throughput_qps'].mean():.1f} QPS")
-    c3.metric("GPU Available",f"{data['df']['gpu_available'].mean():.0%}")
-    st.caption("OctoML's SaaS platform benchmarks compiled models across 50+ hardware targets (Jetson, RPi, Intel, AMD, Apple Silicon) and recommends the optimal deployment target based on latency, throughput, memory, and cost constraints.")
+    st.header("\u2699 Config")
+    n = st.slider("Samples", 100, 2000, 500, 100)
+    batch_size = st.slider("Batch Size", 1, 128, 32, 8)
+    num_threads = st.slider("CPU Threads", 1, 8, 2, 1)
+    run_benchmark = st.button("Run Benchmark")
+    st.caption("EdgeDeploy | MobileNet + ONNX Runtime")
+
+if run_benchmark:
+    with st.spinner("Running benchmark..."):
+        data = make_synthetic(n=n, seed=42)
+        _, val_loader = create_dataloaders(data, batch_size=batch_size, seed=42)
+        model = build_mobilenet(num_classes=1000)
+        results = {}
+        st.info("Benchmarking PyTorch FP32...")
+        pt = evaluate_model(model, val_loader)
+        results["PyTorch FP32"] = {**pt, "size_mb": 0}
+        st.info("Exporting to ONNX...")
+        onnx_path = export_to_onnx(model)
+        onnx_size = get_model_size(onnx_path)
+        st.info("Benchmarking ONNX FP32...")
+        onnx = benchmark_onnx(onnx_path, val_loader, num_threads)
+        results["ONNX FP32"] = {**onnx, "size_mb": onnx_size}
+        st.info("Quantizing ONNX INT8...")
+        quant_path = quantize_onnx(onnx_path)
+        quant_size = get_model_size(quant_path)
+        st.info("Benchmarking ONNX INT8...")
+        quant = benchmark_onnx(quant_path, val_loader, num_threads)
+        results["ONNX INT8"] = {**quant, "size_mb": quant_size}
+        st.success("Benchmark complete!")
+        st.session_state.results = results
+
+st.title("EdgeDeploy: Edge AI Benchmark")
+
+if "results" in st.session_state:
+    results = st.session_state.results
+    c1, c2, c3 = st.columns(3)
+    c1.metric("PyTorch FP32", f'{results["PyTorch FP32"]["avg_latency_ms"]:.1f} ms',
+              help=f'Throughput: {results["PyTorch FP32"]["throughput_fps"]:.0f} fps')
+    c2.metric("ONNX FP32", f'{results["ONNX FP32"]["avg_latency_ms"]:.1f} ms',
+              help=f'Throughput: {results["ONNX FP32"]["throughput_fps"]:.0f} fps')
+    c3.metric("ONNX INT8", f'{results["ONNX INT8"]["avg_latency_ms"]:.1f} ms',
+              help=f'Throughput: {results["ONNX INT8"]["throughput_fps"]:.0f} fps')
+
+    rows = []
+    for variant, r in results.items():
+        rows.append({
+            "Variant": variant,
+            "Avg Latency (ms)": f'{r["avg_latency_ms"]:.2f}',
+            "P50 (ms)": f'{r["p50_latency_ms"]:.2f}',
+            "P95 (ms)": f'{r["p95_latency_ms"]:.2f}',
+            "Throughput (fps)": f'{r["throughput_fps"]:.0f}',
+            "Size (MB)": f'{r["size_mb"]:.2f}' if r["size_mb"] > 0 else "N/A",
+        })
+    st.dataframe(pd.DataFrame(rows).set_index("Variant"), use_container_width=True)
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a: st.pyplot(plot_latency_comparison(results))
+    with col_b: st.pyplot(plot_size_comparison(results))
+    with col_c: st.pyplot(plot_throughput_comparison(results))
+else:
+    st.info("Click 'Run Benchmark' in the sidebar to start.")
+    st.markdown("""
+    **EdgeDeploy** benchmarks MobileNet-V2 across three deployment variants:
+    - **PyTorch FP32**: Full precision, eager mode
+    - **ONNX FP32**: ONNX Runtime with graph optimizations
+    - **ONNX INT8**: Dynamic quantization (QInt8 weights)
+    """)
